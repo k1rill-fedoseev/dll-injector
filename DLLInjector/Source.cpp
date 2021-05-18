@@ -1,7 +1,8 @@
 #include <windows.h>
-#include <winternl.h>
+// #include <winternl.h>
 #include <tchar.h>
 #include <psapi.h>
+#include "native.h"
 
 #include "Remote.h"
 
@@ -36,27 +37,33 @@ DWORD CreateProc(LPCTSTR targetApp, HANDLE& hProc, HANDLE& hThread) {
 DWORD LoopEntry(HANDLE& hProc, HANDLE& hThread, ULONG_PTR& pRemoteEntryPoint, WORD& originalEntryPoint) {
 	PROCESS_BASIC_INFORMATION pbi = {};
 	ULONG len;
-	PEB peb = {};
+	PEB64 peb = {};
 	IMAGE_DOS_HEADER dos = {};
 	IMAGE_NT_HEADERS32 nt = {};
 
-	NTSTATUS status = NtQueryInformationProcess(hProc, ProcessBasicInformation, &pbi, sizeof(PROCESS_BASIC_INFORMATION), &len);
-	if (status < 0) {
-		_tprintf(_T("LoopEntry has failed with code -0x%x\n"), -status);
+
+	NTSTATUS status = ZwQueryInformationProcess(hProc, 0, &pbi, sizeof(PROCESS_BASIC_INFORMATION), &len);
+	if (status) {
+		_tprintf(_T("LoopEntry has failed with code 0x%x\n"), status);
 		return status;
 	}
-
 	
-	DWORD err = ReadRemote<PEB>(hProc, (ULONG_PTR)pbi.PebBaseAddress, peb);
+	DWORD err = ReadRemote<PEB64>(hProc, (ULONG_PTR)pbi.PebBaseAddress, peb);
 	if (err != 0) return err;
 
-	ULONG_PTR pRemoteImageBase = (ULONG_PTR)peb.Reserved3[1];
+	ULONG_PTR pRemoteImageBase = (ULONG_PTR)peb.ImageBaseAddress;
 
 	err = ReadRemote<IMAGE_DOS_HEADER>(hProc, pRemoteImageBase, dos);
 	if (err != 0) return err;
 
 	err = ReadRemote<IMAGE_NT_HEADERS32>(hProc, pRemoteImageBase + dos.e_lfanew, nt);
 	if (err != 0) return err;
+
+	if (nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+		_tprintf(_T("64 bit entry 0x%x\n"), nt.OptionalHeader.AddressOfEntryPoint);
+	} else {
+		_tprintf(_T("32 bit entry 0x%x\n"), nt.OptionalHeader.AddressOfEntryPoint);
+	}
 
 	pRemoteEntryPoint = pRemoteImageBase + nt.OptionalHeader.AddressOfEntryPoint;
 
@@ -80,41 +87,41 @@ DWORD LoopEntry(HANDLE& hProc, HANDLE& hThread, ULONG_PTR& pRemoteEntryPoint, WO
 }
 
 DWORD Inject(HANDLE hProc, HANDLE hThread, ULONG_PTR pRemoteLoadLibrary) {
-	UCHAR shellx86[]{
-		/*0x00: */ 0x90, 0x90, 0x90, 0x90, 0x90,       // nop
-		/*0x05: */ 0x68, 0x00, 0x00, 0x00, 0x00,       // push string
-		/*0x0A: */ 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, // call LoadLibraryW
-		/*0x10: */ 0xF7, 0xD8,                         // neg eax
-		/*0x12: */ 0x1B, 0xC0,                         // sbb eax, eax
-		/*0x14: */ 0xF7, 0xD8,                         // neg eax
-		/*0x16: */ 0x48,                               // dec eax
-		/*0x17: */ 0xC3,                               // ret
+	UCHAR shellCode[]{
+		/*0x00  */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // load library ptr
+		/*0x08  */ 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+		/*0x10  */ 0x48, 0xb9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rcx, string pointer
+		/*0x12: */ 0x90, 0x90, 0x90, 0x90, 0x90, 0xcc, // nop alignment
+		/*0x20: */ 0xFF, 0x15, 0xDA, 0xFF, 0xFF, 0xFF, // call LoadLibraryW
+		/*0x26: */ 0xF7, 0xD8,                         // neg eax
+		/*0x28: */ 0x1B, 0xC0,                         // sbb eax, eax
+		/*0x2a: */ 0xF7, 0xD8,                         // neg eax
+		/*0x2c: */ 0x48,                               // dec eax
+		/*0x2d: */ 0xC3,                               // ret
 
-		/*0x18: */ 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-		/*0x20: */ 0x00, 0x00, 0x00, 0x00,
-		/*0x24: */ 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+		/*0x2e: */ 0x90, 0x90,
 
-		// C:\Users\KIRUHA\source\repos\DLLInjector\Release\DLLInjection.dll
-		// 433a5c55736572735c4b49525548415c736f757263655c7265706f735c444c4c496e6a6563746f725c52656c656173655c444c4c496e6a656374696f6e2e646c6c
-		/*0x30: */ 0x43, 0x00, 0x3a, 0x00, 0x5c, 0x00, 0x55, 0x00, 0x73, 0x00, 0x65, 0x00, 0x72, 0x00, 0x73, 0x00, 0x5c, 0x00, 0x4b, 0x00, 0x49, 0x00, 0x52, 0x00, 0x55, 0x00, 0x48, 0x00, 0x41, 0x00, 0x5c, 0x00, 0x73, 0x00, 0x6f, 0x00, 0x75, 0x00, 0x72, 0x00, 0x63, 0x00, 0x65, 0x00, 0x5c, 0x00, 0x72, 0x00, 0x65, 0x00, 0x70, 0x00, 0x6f, 0x00, 0x73, 0x00, 0x5c, 0x00, 0x44, 0x00, 0x4c, 0x00, 0x4c, 0x00, 0x49, 0x00, 0x6e, 0x00, 0x6a, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74, 0x00, 0x6f, 0x00, 0x72, 0x00, 0x5c, 0x00, 0x52, 0x00, 0x65, 0x00, 0x6c, 0x00, 0x65, 0x00, 0x61, 0x00, 0x73, 0x00, 0x65, 0x00, 0x5c, 0x00, 0x44, 0x00, 0x4c, 0x00, 0x4c, 0x00, 0x49, 0x00, 0x6e, 0x00, 0x6a, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74, 0x00, 0x69, 0x00, 0x6f, 0x00, 0x6e, 0x00, 0x2e, 0x00, 0x64, 0x00, 0x6c, 0x00, 0x6c, 0x00
+		// C:\Users\KIRUHA\source\repos\DLLInjector\Release\DLLInjection.dll - x86
+		// C:\Users\KIRUHA\source\repos\DLLInjector\x64\Release\DLLInjection.dll -x64
+		// 433a5c55736572735c4b49525548415c736f757263655c7265706f735c444c4c496e6a6563746f725c52656c656173655c444c4c496e6a656374696f6e2e646c6c - x86
+		// 433a5c55736572735c4b49525548415c736f757263655c7265706f735c444c4c496e6a6563746f725c7836345c52656c656173655c444c4c496e6a656374696f6e2e646c6c - x64
+		/*0x30: */ 0x43, 0x00, 0x3a, 0x00, 0x5c, 0x00, 0x55, 0x00, 0x73, 0x00, 0x65, 0x00, 0x72, 0x00, 0x73, 0x00, 0x5c, 0x00, 0x4b, 0x00, 0x49, 0x00, 0x52, 0x00, 0x55, 0x00, 0x48, 0x00, 0x41, 0x00, 0x5c, 0x00, 0x73, 0x00, 0x6f, 0x00, 0x75, 0x00, 0x72, 0x00, 0x63, 0x00, 0x65, 0x00, 0x5c, 0x00, 0x72, 0x00, 0x65, 0x00, 0x70, 0x00, 0x6f, 0x00, 0x73, 0x00, 0x5c, 0x00, 0x44, 0x00, 0x4c, 0x00, 0x4c, 0x00, 0x49, 0x00, 0x6e, 0x00, 0x6a, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74, 0x00, 0x6f, 0x00, 0x72, 0x00, 0x5c, 0x00, 0x78, 0x00, 0x36, 0x00, 0x34, 0x00, 0x5c, 0x00, 0x52, 0x00, 0x65, 0x00, 0x6c, 0x00, 0x65, 0x00, 0x61, 0x00, 0x73, 0x00, 0x65, 0x00, 0x5c, 0x00, 0x44, 0x00, 0x4c, 0x00, 0x4c, 0x00, 0x49, 0x00, 0x6e, 0x00, 0x6a, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74, 0x00, 0x69, 0x00, 0x6f, 0x00, 0x6e, 0x00, 0x2e, 0x00, 0x64, 0x00, 0x6c, 0x00, 0x6c, 0x00
 	};
 
-	LPVOID pShellRemote = VirtualAllocEx(hProc, nullptr, sizeof(shellx86), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+	LPVOID pShellRemote = VirtualAllocEx(hProc, nullptr, sizeof(shellCode), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 	ULONG_PTR shellBase = (ULONG_PTR)pShellRemote;
-	ULONG_PTR funcOffset = shellBase + 0x20;
 	ULONG_PTR strOffset = shellBase + 0x30;
 
-	memcpy(shellx86 + 0x20, &pRemoteLoadLibrary, sizeof(ULONG_PTR));
-	memcpy(shellx86 + 0x06, &strOffset, sizeof(ULONG_PTR));
-	memcpy(shellx86 + 0x0c, &funcOffset, sizeof(ULONG_PTR));
+	memcpy(shellCode, &pRemoteLoadLibrary, sizeof(ULONG_PTR));
+	memcpy(shellCode + 0x12, &strOffset, sizeof(ULONG_PTR));
 
 	SIZE_T written = 0;
 	// move memory
-	WriteProcessMemory(hProc, pShellRemote, shellx86, sizeof(shellx86), &written);
+	WriteProcessMemory(hProc, pShellRemote, shellCode, sizeof(shellCode), &written);
 
 	// create remote thread
 	DWORD tid;
-	HANDLE hRemoteThread = CreateRemoteThread(hProc, nullptr, 0, LPTHREAD_START_ROUTINE(shellBase), nullptr, 0, &tid);
+	HANDLE hRemoteThread = CreateRemoteThread(hProc, nullptr, 0, LPTHREAD_START_ROUTINE(shellBase + 0x10), nullptr, 0, &tid);
 
 	WaitForSingleObject(hRemoteThread, INFINITE);
 
@@ -133,8 +140,8 @@ extern "C" NTSYSCALLAPI NTSTATUS NTAPI NtResumeProcess(HANDLE proc);
 
 DWORD DeloopEntry(HANDLE& hProc, HANDLE& hThread, ULONG_PTR& pRemoteEntryPoint, WORD& originalEntryPoint) {
 	NTSTATUS status = NtSuspendProcess(hProc);
-	if (status < 0) {
-		_tprintf(_T("NtSuspendProcess has failed with code -0x%x\n"), -status);
+	if (status) {
+		_tprintf(_T("NtSuspendProcess has failed with code 0x%x\n"), status);
 		return status;
 	}
 
@@ -142,8 +149,8 @@ DWORD DeloopEntry(HANDLE& hProc, HANDLE& hThread, ULONG_PTR& pRemoteEntryPoint, 
 	if (err != 0) return err;
 
 	status = NtResumeProcess(hProc);
-	if (status < 0) {
-		_tprintf(_T("NtResumeProcess has failed with code -0x%x\n"), -status);
+	if (status) {
+		_tprintf(_T("NtResumeProcess has failed with code 0x%x\n"), status);
 		return status;
 	}
 
@@ -168,10 +175,10 @@ DWORD FindLoadLibrary(HANDLE& hProc, HANDLE& hThread, ULONG_PTR& pRemoteLoadLibr
 	for (DWORD i = 0; i < amount; i++) {
 		ULONG_PTR moduleBase = (ULONG_PTR)hModules[i];
 		IMAGE_DOS_HEADER dos = {};
-		IMAGE_NT_HEADERS32 nt = {};
+		IMAGE_NT_HEADERS64 nt = {};
 		
 		ReadRemote<IMAGE_DOS_HEADER>(hProc, moduleBase, dos);
-		ReadRemote<IMAGE_NT_HEADERS32>(hProc, moduleBase + dos.e_lfanew, nt);
+		ReadRemote<IMAGE_NT_HEADERS64>(hProc, moduleBase + dos.e_lfanew, nt);
 		
 		IMAGE_DATA_DIRECTORY exportDir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
 
@@ -189,12 +196,12 @@ DWORD FindLoadLibrary(HANDLE& hProc, HANDLE& hThread, ULONG_PTR& pRemoteLoadLibr
 
 		DWORD numOfFuncs = moduleExport.NumberOfFunctions;
 
-		ULONG_PTR* functionNamesRva = (ULONG_PTR*)malloc(sizeof(ULONG_PTR) * numOfFuncs);
-		ULONG_PTR* functionAddrsRva = (ULONG_PTR*)malloc(sizeof(ULONG_PTR) * numOfFuncs);
+		DWORD* functionNamesRva = (DWORD*)malloc(sizeof(DWORD) * numOfFuncs);
+		DWORD* functionAddrsRva = (DWORD*)malloc(sizeof(DWORD) * numOfFuncs);
 		WORD* functionOrdinals = (WORD*)malloc(sizeof(WORD) * numOfFuncs);
 
-		ReadRemote<ULONG_PTR>(hProc, moduleBase + moduleExport.AddressOfNames, functionNamesRva, numOfFuncs);
-		ReadRemote<ULONG_PTR>(hProc, moduleBase + moduleExport.AddressOfFunctions, functionAddrsRva, numOfFuncs);
+		ReadRemote<DWORD>(hProc, moduleBase + moduleExport.AddressOfNames, functionNamesRva, numOfFuncs);
+		ReadRemote<DWORD>(hProc, moduleBase + moduleExport.AddressOfFunctions, functionAddrsRva, numOfFuncs);
 		ReadRemote<WORD>(hProc, moduleBase + moduleExport.AddressOfNameOrdinals, functionOrdinals, numOfFuncs);
 
 		for (DWORD j = 0; j < numOfFuncs; j++) {
@@ -222,7 +229,9 @@ DWORD FindLoadLibrary(HANDLE& hProc, HANDLE& hThread, ULONG_PTR& pRemoteLoadLibr
 }
 
 int main() {
-	LPCTSTR targetApp = _T("C:\\Windows\\SysWOW64\\notepad.exe");
+	//LPCTSTR targetApp = _T("C:\\Windows\\SysWOW64\\notepad.exe");
+	//LPCTSTR targetApp = _T("C:\\Program Files\\Notepad++\\notepad++.exe");
+	LPCTSTR targetApp = _T("C:\\Windows\\System32\\notepad.exe");
 	HANDLE hProc = INVALID_HANDLE_VALUE;
 	HANDLE hThread = INVALID_HANDLE_VALUE;
 	DWORD status = ERROR_SUCCESS;
